@@ -207,7 +207,10 @@ async def _shutdown_abandoned_app(app) -> None:
             logger.debug("Abandoned Telegram request shutdown failed", exc_info=True)
 
 try:
-    from telegram import Update, Bot, Message, InlineKeyboardButton, InlineKeyboardMarkup
+    from telegram import (
+        Update, Bot, Message, InlineKeyboardButton, InlineKeyboardMarkup,
+        ReplyKeyboardMarkup,
+    )
     try:
         from telegram import LinkPreviewOptions
     except ImportError:
@@ -3574,6 +3577,8 @@ class TelegramAdapter(BasePlatformAdapter):
             self._bot = self._app.bot
             
             # Register handlers
+            self._app.add_handler(CommandHandler("menu", self._send_main_menu))
+            self._app.add_handler(CommandHandler("modelmenu", self._send_main_menu))
             self._app.add_handler(TelegramMessageHandler(
                 filters.TEXT & ~filters.COMMAND,
                 self._handle_text_message
@@ -5471,7 +5476,10 @@ class TelegramAdapter(BasePlatformAdapter):
                 nav.append(InlineKeyboardButton("Next ▶", callback_data=f"mpv:{page + 1}"))
             rows.append(nav)
 
-        rows.append([InlineKeyboardButton("✗ Cancel", callback_data="mx")])
+        rows.append([
+            InlineKeyboardButton("🔍 Search Models", callback_data="ms:init"),
+            InlineKeyboardButton("✗ Cancel", callback_data="mx"),
+        ])
 
         page_info = f" ({start + 1}–{end} of {total})" if total_pages > 1 else ""
         return InlineKeyboardMarkup(rows), page_info
@@ -5531,6 +5539,18 @@ class TelegramAdapter(BasePlatformAdapter):
         except ImportError:
             def get_label(slug):
                 return slug
+
+        if data == "ms:init":
+            state["mode"] = "search"
+            await query.answer(text="Send a message to search for models.")
+            await query.edit_message_text(
+                "🔍 Model Search\n\nSend a text message now to filter models across all providers.",
+                parse_mode=None,
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("◀ Back", callback_data="mb")
+                ]]),
+            )
+            return
 
         if data.startswith("mp:"):
             # --- Provider selected: show model buttons (page 0) ---
@@ -5893,7 +5913,7 @@ class TelegramAdapter(BasePlatformAdapter):
         query_user_name = getattr(query.from_user, "first_name", None)
 
         # --- Model picker callbacks ---
-        if data.startswith(("mp:", "mpg:", "mpv:", "mm:", "mc:", "mb", "mx", "mg:")):
+        if data.startswith(("mp:", "mpg:", "mpv:", "mm:", "mc:", "mb", "mx", "mg:", "ms:")):
             chat_id = str(query.message.chat_id) if query.message else None
             if chat_id:
                 await self._handle_model_picker_callback(query, data, chat_id)
@@ -8136,11 +8156,62 @@ class TelegramAdapter(BasePlatformAdapter):
             return
         await self._ensure_forum_commands(update.message)
 
+        chat_id_str = str(msg.chat.id)
+        if msg.text.strip() == "Switch Model":
+            event = self._build_message_event(msg, MessageType.COMMAND, update_id=update.update_id)
+            event.text = "/model"
+            await self.handle_message(event)
+            return
+
+        picker_state = self._model_picker_state.get(chat_id_str, {})
+        if picker_state.get("mode") == "search":
+            await self._search_model_picker(update, chat_id_str, msg.text.strip())
+            return
+
         event = self._build_message_event(msg, MessageType.TEXT, update_id=update.update_id)
         event.text = self._clean_bot_trigger_text(event.text)
         await self._cache_replied_media(msg, event)
         event = self._apply_telegram_group_observe_attribution(event)
         self._enqueue_text_event(event)
+
+    async def _send_main_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Show the persistent Telegram convenience keyboard."""
+        msg = self._effective_update_message(update)
+        if not msg or not self._is_user_authorized_from_message(msg):
+            return
+        await msg.reply_text(
+            "Chọn từ menu dưới đây hoặc gõ lệnh:",
+            reply_markup=ReplyKeyboardMarkup(
+                [["Switch Model", "/menu", "/help"]],
+                resize_keyboard=True,
+                one_time_keyboard=False,
+                input_field_placeholder="Chọn một tùy chọn:",
+            ),
+        )
+
+    async def _search_model_picker(self, update: Update, chat_id: str, query_text: str) -> None:
+        """Filter the active picker without forwarding the search as an agent turn."""
+        state = self._model_picker_state.get(chat_id, {})
+        needle = query_text.casefold().strip()
+        matches = []
+        for provider in state.get("providers", []):
+            models = [m for m in provider.get("models", []) if needle in str(m).casefold()]
+            if models:
+                item = dict(provider)
+                item["models"] = models
+                item["total_models"] = len(models)
+                matches.append(item)
+        if not matches:
+            await update.effective_message.reply_text(f"Không tìm thấy model khớp với: {query_text}")
+            return
+        state["providers"] = matches
+        state["mode"] = None
+        state["provider_page"] = 0
+        keyboard, page_info = self._build_provider_keyboard(matches, 0)
+        sent = await update.effective_message.reply_text(
+            f"🔍 Kết quả cho “{query_text}”{page_info}:", reply_markup=keyboard,
+        )
+        state["msg_id"] = sent.message_id
 
     async def _handle_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming command messages."""

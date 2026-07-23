@@ -221,6 +221,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
                subcommands=("connect", "disconnect", "status")),
     CommandDef("plugins", "List installed plugins and their status",
                "Tools & Skills", cli_only=True),
+    CommandDef("clone-website", "Clone any website into Next.js code (e.g. /clone-website <URL>)",
+               "Tools & Skills", args_hint="<url> [project-name]"),
 
     # Info
     CommandDef("commands", "Browse all commands and skills (paginated)", "Info",

@@ -501,6 +501,15 @@ class ChatCompletionsTransport(ProviderTransport):
         if additions:
             extra_body.update(additions)
 
+        # Ollama num_ctx injection — pass the detected context length so the
+        # model sees the full system prompt and conversation history instead of
+        # the Ollama default of 4096 tokens.  Detected in agent_init.py via
+        # ``query_ollama_num_ctx()`` and capped by the user's explicit
+        # ``model.context_length`` / ``model.ollama_num_ctx`` config.
+        _ollama_ctx = params.get("ollama_num_ctx")
+        if _ollama_ctx is not None and _ollama_ctx > 0:
+            extra_body["num_ctx"] = _ollama_ctx
+
         if extra_body:
             api_kwargs["extra_body"] = extra_body
 

@@ -2197,6 +2197,33 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
         )
     )
 
+    # ── Ollama num_ctx detection ──
+    # When switching to a local Ollama endpoint, detect the model's context
+    # length so it can be passed as num_ctx in chat requests. Without this,
+    # Ollama defaults to 4096 and truncates the system prompt, losing identity
+    # instructions like SOUL.md.
+    if agent._ollama_num_ctx is None and agent.base_url:
+        from agent.model_metadata import is_local_endpoint, query_ollama_num_ctx
+        if is_local_endpoint(agent.base_url):
+            try:
+                import logging
+                _key = agent.api_key if isinstance(agent.api_key, str) else ""
+                _detected = query_ollama_num_ctx(
+                    agent.model, agent.base_url, api_key=_key or "",
+                )
+                if _detected and _detected > 0:
+                    agent._ollama_num_ctx = _detected
+                    logging.getLogger(__name__).info(
+                        "Ollama num_ctx: will request %d tokens "
+                        "(detected during model switch)",
+                        _detected,
+                    )
+            except Exception as exc:
+                import logging
+                logging.getLogger(__name__).debug(
+                    "Ollama num_ctx detection failed on switch: %s", exc,
+                )
+
     # ── LM Studio: preload before probing context length ──
     agent._ensure_lmstudio_runtime_loaded()
 
