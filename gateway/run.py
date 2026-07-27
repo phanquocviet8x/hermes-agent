@@ -11955,6 +11955,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
         """Inner handler that runs under the _running_agents sentinel guard."""
+        # The primary multiplex adapter enters this method without the secondary
+        # profile wrapper. Install the routed profile's HERMES_HOME + secret scope
+        # for the complete turn, including pre-agent session hygiene. Without this,
+        # hygiene's custom-provider/API-key lookup fails closed via get_secret('').
+        if (
+            getattr(getattr(self, "config", None), "multiplex_profiles", False)
+            and not getattr(source, "_hygiene_profile_scope_active", False)
+        ):
+            setattr(source, "_hygiene_profile_scope_active", True)
+            try:
+                with _profile_runtime_scope(self._resolve_profile_home_for_source(source)):
+                    return await self._handle_message_with_agent(
+                        event, source, _quick_key, run_generation
+                    )
+            finally:
+                try:
+                    delattr(source, "_hygiene_profile_scope_active")
+                except AttributeError:
+                    pass
+
         _msg_start_time = time.time()
         _platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
         _msg_preview = (event.text or "")[:80].replace("\n", " ")

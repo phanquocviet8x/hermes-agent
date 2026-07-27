@@ -23,6 +23,16 @@ from gateway.platforms.base import BasePlatformAdapter, MessageEvent, SendResult
 from gateway.session import SessionEntry, SessionSource
 
 
+def test_multiplex_hygiene_runs_inside_routed_profile_secret_scope():
+    """Regression: hygiene used get_secret after the per-turn scope had ended."""
+    import inspect
+    from gateway import run as gateway_run
+
+    source = inspect.getsource(gateway_run.GatewayRunner._handle_message_with_agent)
+    assert "_hygiene_profile_scope_active" in source
+    assert "with _profile_runtime_scope(self._resolve_profile_home_for_source(source))" in source
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
