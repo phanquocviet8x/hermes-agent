@@ -11407,7 +11407,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _run_generation = self._begin_session_run_generation(_quick_key)
 
         try:
-            _agent_result = await self._handle_message_with_agent(event, source, _quick_key, _run_generation)
+            _agent_result = await self._handle_profile_scoped_message_with_agent(
+                event, source, _quick_key, _run_generation
+            )
             # Goal continuation: after the agent returns a final response
             # for this turn, check any standing /goal — the judge will
             # either mark it done, pause it (budget), or enqueue a
@@ -11953,6 +11955,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 pass
         return source
 
+    async def _handle_profile_scoped_message_with_agent(
+        self, event, source, quick_key: str, run_generation: int
+    ):
+        """Run the complete turn under its routed profile in multiplex mode.
+
+        This includes pre-turn hygiene/compression, whose model credential reads
+        otherwise occur before the narrower agent executor scope is installed.
+        """
+        if getattr(getattr(self, "config", None), "multiplex_profiles", False):
+            with _profile_runtime_scope(self._resolve_profile_home_for_source(source)):
+                return await self._handle_message_with_agent(
+                    event, source, quick_key, run_generation
+                )
+        return await self._handle_message_with_agent(event, source, quick_key, run_generation)
+
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
         """Inner handler that runs under the _running_agents sentinel guard."""
         # The primary multiplex adapter enters this method without the secondary
@@ -12345,7 +12362,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _hyg_model = "anthropic/claude-sonnet-4.6"
             _hyg_threshold_pct = 0.85
             _hyg_compression_enabled = True
-            _hyg_hard_msg_limit = 5000
+            # Keep this below OmniRoute's hard 800-message admission cap. The
+            # token threshold normally fires first; this is the deterministic
+            # safety valve when reported token usage is missing or stale.
+            _hyg_hard_msg_limit = 700
             _hyg_config_context_length = None
             _hyg_provider = None
             _hyg_base_url = None
@@ -12468,10 +12488,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # death spiral where API disconnects prevent token data
                 # collection, which prevents compression, which causes more
                 # disconnects.  5000 messages is far above any normal session
-                # but catches truly runaway growth before it becomes
-                # unrecoverable.  Set well clear of legitimate large-context
-                # (1M+) sessions doing thousands of short turns — those
-                # compress on the token threshold, not this count-based floor.
+                # but catches runaway growth before OmniRoute's 800-message
+                # hard admission cap makes the session unrecoverable.
                 # Threshold is configurable via
                 # compression.hygiene_hard_message_limit.
                 # (#2153)
