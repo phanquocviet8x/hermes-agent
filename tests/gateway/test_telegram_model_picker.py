@@ -44,6 +44,179 @@ def _make_adapter():
 
 class TestTelegramModelPicker:
     @pytest.mark.asyncio
+    async def test_live_search_filters_full_catalog_and_back_restores_picker(self, monkeypatch):
+        """A search from the Model picker stays inside Telegram, filters the
+        full live catalog, and Back restores all providers."""
+        import plugins.platforms.telegram.adapter as tg
+
+        class _Button:
+            def __init__(self, text, callback_data=None, **_kwargs):
+                self.text = text
+                self.callback_data = callback_data
+
+        class _Markup:
+            def __init__(self, rows):
+                self.inline_keyboard = rows
+
+        monkeypatch.setattr(tg, "InlineKeyboardButton", _Button)
+        monkeypatch.setattr(tg, "InlineKeyboardMarkup", _Markup)
+        adapter = _make_adapter()
+        adapter._model_picker_state["12345"] = {
+            "providers": [{"slug": "first", "name": "First", "models": ["alpha"], "total_models": 1}],
+            "all_providers": [
+                {"slug": "first", "name": "First", "models": ["alpha"], "total_models": 1},
+                {"slug": "second", "name": "Second", "models": ["gpt-5.5"], "total_models": 1},
+            ],
+            "current_model": "alpha",
+            "current_provider": "first",
+            "session_key": "s",
+            "on_model_selected": AsyncMock(),
+            "mode": "search",
+            "provider_page": 0,
+        }
+        msg = SimpleNamespace(reply_text=AsyncMock(return_value=SimpleNamespace(message_id=9)))
+        update = SimpleNamespace(effective_message=msg)
+
+        await adapter._search_model_picker(update, "12345", "gpt-5")
+
+        state = adapter._model_picker_state["12345"]
+        assert [p["slug"] for p in state["providers"]] == ["second"]
+        assert state["mode"] is None
+        assert "Kết quả" in msg.reply_text.await_args.args[0]
+
+        query = AsyncMock()
+        query.message = SimpleNamespace(chat_id=12345)
+        query.edit_message_text = AsyncMock()
+        query.answer = AsyncMock()
+        await adapter._handle_model_picker_callback(query, "mb", "12345")
+        assert [p["slug"] for p in state["providers"]] == ["first", "second"]
+
+    @pytest.mark.asyncio
+    async def test_live_search_can_find_model_after_first_fifty_entries(self, monkeypatch):
+        """The live picker must keep the full catalog rather than the old
+        50-model display cap, otherwise the requested search is misleading."""
+        import plugins.platforms.telegram.adapter as tg
+
+        class _Button:
+            def __init__(self, text, callback_data=None, **_kwargs):
+                self.text = text
+                self.callback_data = callback_data
+
+        class _Markup:
+            def __init__(self, rows):
+                self.inline_keyboard = rows
+
+        monkeypatch.setattr(tg, "InlineKeyboardButton", _Button)
+        monkeypatch.setattr(tg, "InlineKeyboardMarkup", _Markup)
+        adapter = _make_adapter()
+        catalog = [f"model-{i}" for i in range(60)] + ["needle-live-model"]
+        adapter._model_picker_state["12345"] = {
+            "providers": [{"slug": "provider", "name": "Provider", "models": catalog, "total_models": len(catalog)}],
+            "all_providers": [{"slug": "provider", "name": "Provider", "models": catalog, "total_models": len(catalog)}],
+            "mode": "search",
+        }
+        msg = SimpleNamespace(reply_text=AsyncMock(return_value=SimpleNamespace(message_id=9)))
+
+        await adapter._search_model_picker(SimpleNamespace(effective_message=msg), "12345", "needle")
+
+        assert adapter._model_picker_state["12345"]["providers"][0]["models"] == ["needle-live-model"]
+
+    def test_provider_model_keyboard_includes_live_search_button(self, monkeypatch):
+        """The search button must appear inside a provider's model page, not
+        only on the top-level provider list."""
+        import plugins.platforms.telegram.adapter as tg
+
+        class _Button:
+            def __init__(self, text, callback_data=None, **_kwargs):
+                self.text = text
+                self.callback_data = callback_data
+
+        class _Markup:
+            def __init__(self, rows):
+                self.inline_keyboard = rows
+
+        monkeypatch.setattr(tg, "InlineKeyboardButton", _Button)
+        monkeypatch.setattr(tg, "InlineKeyboardMarkup", _Markup)
+        adapter = _make_adapter()
+
+        keyboard, page_info = adapter._build_model_keyboard([f"model-{i}" for i in range(20)], 0)
+
+        callbacks = [button.callback_data for row in keyboard.inline_keyboard for button in row]
+        assert "ms:models" in callbacks
+        assert page_info == " (1–8 of 20)"
+
+    @pytest.mark.asyncio
+    async def test_provider_model_live_search_filters_selected_provider_only(self, monkeypatch):
+        import plugins.platforms.telegram.adapter as tg
+
+        class _Button:
+            def __init__(self, text, callback_data=None, **_kwargs):
+                self.text = text
+                self.callback_data = callback_data
+
+        class _Markup:
+            def __init__(self, rows):
+                self.inline_keyboard = rows
+
+        monkeypatch.setattr(tg, "InlineKeyboardButton", _Button)
+        monkeypatch.setattr(tg, "InlineKeyboardMarkup", _Markup)
+        adapter = _make_adapter()
+        adapter._model_picker_state["12345"] = {
+            "selected_provider": "omniroute",
+            "selected_provider_name": "omniroute",
+            "model_list": ["gpt-4o", "claude-sonnet", "gpt-5.5"],
+            "provider_model_source": ["gpt-4o", "claude-sonnet", "gpt-5.5"],
+            "mode": "model_search",
+        }
+        msg = SimpleNamespace(reply_text=AsyncMock(return_value=SimpleNamespace(message_id=12)))
+
+        await adapter._search_provider_model_picker(
+            SimpleNamespace(effective_message=msg), "12345", "5.5"
+        )
+
+        state = adapter._model_picker_state["12345"]
+        assert state["model_list"] == ["gpt-5.5"]
+        assert state["mode"] is None
+        assert "Kết quả trong omniroute" in msg.reply_text.await_args.args[0]
+
+    @pytest.mark.asyncio
+    async def test_live_search_requires_authorized_callback_user(self, monkeypatch):
+        adapter = _make_adapter()
+        adapter._model_picker_state["12345"] = {"providers": []}
+        monkeypatch.setattr(adapter, "_is_callback_user_authorized", lambda *args, **kwargs: False)
+        query = AsyncMock()
+        query.from_user = SimpleNamespace(id=99, first_name="Other")
+        query.message = SimpleNamespace(
+            chat_id=12345, chat=SimpleNamespace(type="group"), message_thread_id=None
+        )
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+
+        await adapter._handle_model_picker_callback(query, "ms:init", "12345")
+
+        assert adapter._model_picker_state["12345"].get("mode") is None
+        query.answer.assert_awaited_once()
+        query.edit_message_text.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_live_search_callback_binds_query_to_initiating_user(self, monkeypatch):
+        adapter = _make_adapter()
+        adapter._model_picker_state["12345"] = {"providers": []}
+        monkeypatch.setattr(adapter, "_is_callback_user_authorized", lambda *args, **kwargs: True)
+        query = AsyncMock()
+        query.from_user = SimpleNamespace(id=7, first_name="ViPi")
+        query.message = SimpleNamespace(
+            chat_id=12345, chat=SimpleNamespace(type="private"), message_thread_id=None
+        )
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+
+        await adapter._handle_model_picker_callback(query, "ms:init", "12345")
+
+        assert adapter._model_picker_state["12345"]["mode"] == "search"
+        assert adapter._model_picker_state["12345"]["search_user_id"] == "7"
+
+    @pytest.mark.asyncio
     async def test_send_model_picker_escapes_dynamic_provider_label(self):
         adapter = _make_adapter()
         sent = {}

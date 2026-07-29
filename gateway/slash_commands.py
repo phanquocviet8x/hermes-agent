@@ -1556,7 +1556,11 @@ class GatewaySlashCommandsMixin:
                         current_model=current_model,
                         user_providers=user_provs,
                         custom_providers=custom_provs,
-                        max_models=50,
+                        # The Telegram picker has a native live search field;
+                        # keep the full callable catalog in its state so a
+                        # model omitted from the first UI pages remains
+                        # discoverable without falling back to a typed command.
+                        max_models=None,
                         include_moa=True,
                         excluded_providers=excluded_provs,
                     )

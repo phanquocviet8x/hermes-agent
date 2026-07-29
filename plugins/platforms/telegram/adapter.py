@@ -16,8 +16,10 @@ import logging
 import os
 import html as _html
 import re
+import shutil
 import threading
 import time
+from pathlib import Path as _Path
 from contextvars import ContextVar
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Set, Any
@@ -5272,6 +5274,10 @@ class TelegramAdapter(BasePlatformAdapter):
             # Store picker state keyed by chat_id
             self._model_picker_state[str(chat_id)] = {
                 "msg_id": msg.message_id,
+                # Keep an immutable-ish full source. Search must always scan
+                # every model even after a previous search narrowed the visible
+                # provider list.
+                "all_providers": providers,
                 "providers": providers,
                 "session_key": session_key,
                 "on_model_selected": on_model_selected,
@@ -5517,6 +5523,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 nav.append(InlineKeyboardButton("Next ▶", callback_data=f"mg:{page + 1}"))
             rows.append(nav)
 
+        rows.append([InlineKeyboardButton("🔍 Search Live", callback_data="ms:models")])
         rows.append([
             InlineKeyboardButton("◀ Back", callback_data="mb"),
             InlineKeyboardButton("✗ Cancel", callback_data="mx"),
@@ -5540,14 +5547,47 @@ class TelegramAdapter(BasePlatformAdapter):
             def get_label(slug):
                 return slug
 
-        if data == "ms:init":
-            state["mode"] = "search"
+        if data in {"ms:init", "ms:models"}:
+            # A reply keyboard button opens the picker in the current chat, but
+            # inline callbacks can be tapped by other group members. Keep the
+            # live search entry behind the same authorization gate as settings.
+            query_message = getattr(query, "message", None)
+            query_chat = getattr(query_message, "chat", None)
+            if not self._is_callback_user_authorized(
+                str(getattr(query.from_user, "id", "")),
+                chat_id=getattr(query_message, "chat_id", None),
+                chat_type=(
+                    str(getattr(query_chat, "type", None))
+                    if getattr(query_chat, "type", None) is not None
+                    else None
+                ),
+                thread_id=(
+                    str(getattr(query_message, "message_thread_id", None))
+                    if getattr(query_message, "message_thread_id", None) is not None
+                    else None
+                ),
+                user_name=getattr(query.from_user, "first_name", None),
+            ):
+                await query.answer(text="⛔ You are not authorized to search models.")
+                return
+            if data == "ms:models" and not state.get("selected_provider"):
+                await query.answer(text="Choose a provider first.")
+                return
+            state["mode"] = "model_search" if data == "ms:models" else "search"
+            state["search_user_id"] = str(getattr(query.from_user, "id", ""))
             await query.answer(text="Send a message to search for models.")
+            back_callback = f"mp:{state.get('selected_provider')}" if data == "ms:models" else "mb"
+            provider_name = state.get("selected_provider_name") or state.get("selected_provider") or "selected provider"
+            prompt = (
+                f"🔍 Model Search\n\nSend a text message now to filter models inside {provider_name}."
+                if data == "ms:models"
+                else "🔍 Model Search\n\nSend a text message now to filter models across all providers."
+            )
             await query.edit_message_text(
-                "🔍 Model Search\n\nSend a text message now to filter models across all providers.",
+                prompt,
                 parse_mode=None,
                 reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("◀ Back", callback_data="mb")
+                    InlineKeyboardButton("◀ Back", callback_data=back_callback)
                 ]]),
             )
             return
@@ -5567,6 +5607,7 @@ class TelegramAdapter(BasePlatformAdapter):
             state["selected_provider"] = provider_slug
             state["selected_provider_name"] = provider.get("name", provider_slug)
             state["model_list"] = models
+            state["provider_model_source"] = models
             state["model_page"] = 0
 
             keyboard, page_info = self._build_model_keyboard(models, 0)
@@ -5835,6 +5876,8 @@ class TelegramAdapter(BasePlatformAdapter):
 
         elif data == "mb":
             # --- Back to provider list (folds groups) ---
+            state["mode"] = None
+            state["providers"] = state.get("all_providers", state["providers"])
             page = int(state.get("provider_page", 0) or 0)
             keyboard, provider_page_info = self._build_provider_keyboard(
                 state["providers"], page
@@ -5911,6 +5954,11 @@ class TelegramAdapter(BasePlatformAdapter):
         query_chat_type = getattr(query_chat, "type", None)
         query_thread_id = getattr(query_message, "message_thread_id", None)
         query_user_name = getattr(query.from_user, "first_name", None)
+
+        # --- Router config callbacks ---
+        if data.startswith("rt:"):
+            await self._handle_router_callback(query, data)
+            return
 
         # --- Model picker callbacks ---
         if data.startswith(("mp:", "mpg:", "mpv:", "mm:", "mc:", "mb", "mx", "mg:", "ms:")):
@@ -8129,6 +8177,116 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         return getattr(update, "effective_message", None) or getattr(update, "message", None)
 
+    _ROUTER_CONFIGS = {
+        "omniroute": ("OmniRoute", "/root/.hermes/configominiroute.yaml"),
+        "9router": ("9router", "/root/.hermes/config9router.yaml"),
+        "freellmapi": ("FreeLLMAPI", "/root/.hermes/configfreellmapi.yaml"),
+    }
+
+    def _read_current_router_status(self) -> tuple[str, str, str]:
+        """Return (router_key, router_label, model) without exposing secrets."""
+        config_path = _Path.home() / ".hermes" / "config.yaml"
+        current_provider = ""
+        current_model = "unknown"
+        try:
+            import yaml
+            cfg = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+            model_cfg = cfg.get("model", {}) if isinstance(cfg, dict) else {}
+            if isinstance(model_cfg, dict):
+                current_provider = str(model_cfg.get("provider") or "")
+                current_model = str(model_cfg.get("default") or current_model)
+        except Exception:
+            pass
+
+        provider_l = current_provider.lower()
+        model_l = current_model.lower()
+        if "9router" in provider_l or "9router" in model_l:
+            return "9router", "9router", current_model
+        if "freellm" in provider_l or "freellm" in model_l:
+            return "freellmapi", "FreeLLMAPI", current_model
+        if "omniroute" in provider_l or "omniroute" in model_l or "auto/" in model_l:
+            return "omniroute", "OmniRoute", current_model
+        return "unknown", current_provider or "unknown", current_model
+
+    async def _send_router_picker(self, msg) -> None:
+        """Show router config switcher. Copies source config to config.yaml on tap."""
+        current_key, current_label, current_model = self._read_current_router_status()
+        rows = []
+        for key, (label, _path) in self._ROUTER_CONFIGS.items():
+            prefix = "✓ " if key == current_key else ""
+            rows.append([InlineKeyboardButton(f"{prefix}{label}", callback_data=f"rt:{key}")])
+        await msg.reply_text(
+            self.format_message(
+                f"🔀 *Switch mode*\n\n"
+                f"Router hiện tại: *{current_label}*\n"
+                f"Model hiện tại: `{current_model}`\n\n"
+                f"Chọn router muốn dùng:"
+            ),
+            parse_mode=ParseMode.MARKDOWN_V2,
+            reply_markup=InlineKeyboardMarkup(rows),
+        )
+
+    async def _handle_router_callback(self, query, data: str) -> None:
+        key = data.split(":", 1)[1] if ":" in data else ""
+        if key not in self._ROUTER_CONFIGS:
+            await query.answer(text="Router không hợp lệ.")
+            return
+        query_message = getattr(query, "message", None)
+        query_chat = getattr(query_message, "chat", None)
+        if not self._is_callback_user_authorized(
+            str(getattr(query.from_user, "id", "")),
+            chat_id=getattr(query_message, "chat_id", None),
+            chat_type=str(getattr(query_chat, "type", None)) if getattr(query_chat, "type", None) is not None else None,
+            thread_id=str(getattr(query_message, "message_thread_id", None)) if getattr(query_message, "message_thread_id", None) is not None else None,
+            user_name=getattr(query.from_user, "first_name", None),
+        ):
+            await query.answer(text="⛔ Bạn không có quyền đổi router.")
+            return
+        label, source_path = self._ROUTER_CONFIGS[key]
+        source = _Path(source_path)
+        dest = _Path.home() / ".hermes" / "config.yaml"
+        try:
+            if not source.exists():
+                await query.answer(text=f"Thiếu file {source.name}")
+                return
+            backup = dest.with_name(f"config.yaml.bak-router-{int(time.time())}")
+            if dest.exists():
+                shutil.copy2(dest, backup)
+            shutil.copy2(source, dest)
+            # New router config changes credentials/base URLs: drop cached agents and
+            # session-scoped overrides so the next turn rebuilds from config.yaml.
+            try:
+                self._session_model_overrides.clear()
+            except Exception:
+                pass
+            try:
+                cache_lock = getattr(self, "_agent_cache_lock", None)
+                cache = getattr(self, "_agent_cache", None)
+                if cache_lock and cache is not None:
+                    with cache_lock:
+                        cache.clear()
+            except Exception:
+                pass
+            _, _, current_model = self._read_current_router_status()
+            await query.edit_message_text(
+                text=self.format_message(
+                    f"✅ Đã chuyển router sang *{label}*\n"
+                    f"File gốc vẫn giữ nguyên: `{source_path}`\n"
+                    f"Đã copy ra: `/root/.hermes/config.yaml`\n"
+                    f"Model hiện tại: `{current_model}`"
+                ),
+                parse_mode=ParseMode.MARKDOWN_V2,
+                reply_markup=None,
+            )
+            await query.answer(text=f"✓ {label}")
+        except Exception as exc:
+            logger.error("Telegram router switch failed: %s", exc, exc_info=True)
+            await query.answer(text="Đổi router lỗi.")
+            try:
+                await query.edit_message_text(text=f"❌ Đổi router lỗi: {_redact_telegram_error_text(exc)}")
+            except Exception:
+                pass
+
     async def _handle_text_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming text messages.
 
@@ -8150,22 +8308,35 @@ class TelegramAdapter(BasePlatformAdapter):
                 getattr(getattr(msg, "chat", None), "id", None),
             )
             return
+        chat_id_str = str(msg.chat.id)
+        picker_state = self._model_picker_state.get(chat_id_str, {})
+        # A user who tapped Search Models is intentionally entering a query,
+        # not chatting with the agent. Handle it before group @mention gating;
+        # otherwise the following bare search text would be discarded in groups.
+        # Bind it to the user who opened the inline search mode so another
+        # authorized group member cannot consume the pending search prompt.
+        search_user_id = picker_state.get("search_user_id")
+        sender_id = str(getattr(getattr(msg, "from_user", None), "id", ""))
+        if picker_state.get("mode") in {"search", "model_search"} and sender_id == str(search_user_id or ""):
+            if picker_state.get("mode") == "model_search":
+                await self._search_provider_model_picker(update, chat_id_str, msg.text.strip())
+            else:
+                await self._search_model_picker(update, chat_id_str, msg.text.strip())
+            return
         if not self._should_process_message(msg):
             if self._should_observe_unmentioned_group_message(msg):
                 self._observe_unmentioned_group_message(msg, MessageType.TEXT, update_id=update.update_id)
             return
         await self._ensure_forum_commands(update.message)
 
-        chat_id_str = str(msg.chat.id)
-        if msg.text.strip() == "Switch Model":
+        text_clean = msg.text.strip()
+        if text_clean in {"Switch mode", "Switch Mode", "Switch model", "Switch Model"}:
+            await self._send_router_picker(msg)
+            return
+        if text_clean in {"Model", "model"}:
             event = self._build_message_event(msg, MessageType.COMMAND, update_id=update.update_id)
             event.text = "/model"
             await self.handle_message(event)
-            return
-
-        picker_state = self._model_picker_state.get(chat_id_str, {})
-        if picker_state.get("mode") == "search":
-            await self._search_model_picker(update, chat_id_str, msg.text.strip())
             return
 
         event = self._build_message_event(msg, MessageType.TEXT, update_id=update.update_id)
@@ -8179,10 +8350,11 @@ class TelegramAdapter(BasePlatformAdapter):
         msg = self._effective_update_message(update)
         if not msg or not self._is_user_authorized_from_message(msg):
             return
+        _current_key, current_label, current_model = self._read_current_router_status()
         await msg.reply_text(
-            "Chọn từ menu dưới đây hoặc gõ lệnh:",
+            f"Chọn từ menu dưới đây hoặc gõ lệnh:\nRouter hiện tại: {current_label}\nModel hiện tại: {current_model}",
             reply_markup=ReplyKeyboardMarkup(
-                [["Switch Model", "/menu", "/help"]],
+                [["Switch mode", "Model"]],
                 resize_keyboard=True,
                 one_time_keyboard=False,
                 input_field_placeholder="Chọn một tùy chọn:",
@@ -8194,7 +8366,7 @@ class TelegramAdapter(BasePlatformAdapter):
         state = self._model_picker_state.get(chat_id, {})
         needle = query_text.casefold().strip()
         matches = []
-        for provider in state.get("providers", []):
+        for provider in state.get("all_providers", state.get("providers", [])):
             models = [m for m in provider.get("models", []) if needle in str(m).casefold()]
             if models:
                 item = dict(provider)
@@ -8204,12 +8376,36 @@ class TelegramAdapter(BasePlatformAdapter):
         if not matches:
             await update.effective_message.reply_text(f"Không tìm thấy model khớp với: {query_text}")
             return
+        # Search results are a view; retain all_providers so another live query
+        # (or Back) does not get stuck filtering a previous subset.
         state["providers"] = matches
         state["mode"] = None
         state["provider_page"] = 0
         keyboard, page_info = self._build_provider_keyboard(matches, 0)
         sent = await update.effective_message.reply_text(
             f"🔍 Kết quả cho “{query_text}”{page_info}:", reply_markup=keyboard,
+        )
+        state["msg_id"] = sent.message_id
+
+    async def _search_provider_model_picker(self, update: Update, chat_id: str, query_text: str) -> None:
+        """Filter models inside the currently selected provider only."""
+        state = self._model_picker_state.get(chat_id, {})
+        needle = query_text.casefold().strip()
+        source_models = state.get("provider_model_source") or state.get("model_list", [])
+        matches = [m for m in source_models if needle in str(m).casefold()]
+        provider_name = state.get("selected_provider_name") or state.get("selected_provider") or "provider"
+        if not matches:
+            await update.effective_message.reply_text(
+                f"Không tìm thấy model trong {provider_name} khớp với: {query_text}"
+            )
+            return
+        state["model_list"] = matches
+        state["mode"] = None
+        state["model_page"] = 0
+        keyboard, page_info = self._build_model_keyboard(matches, 0)
+        sent = await update.effective_message.reply_text(
+            f"🔍 Kết quả trong {provider_name} cho “{query_text}”{page_info}:",
+            reply_markup=keyboard,
         )
         state["msg_id"] = sent.message_id
 
