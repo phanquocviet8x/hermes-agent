@@ -8448,7 +8448,7 @@ class TelegramAdapter(BasePlatformAdapter):
         return getattr(update, "effective_message", None) or getattr(update, "message", None)
 
     _ROUTER_CONFIGS = {
-        "omniroute": ("OmniRoute", "configomnirote.yaml"),
+        "omniroute": ("OmniRoute", "configomniroute.yaml"),
         "9router": ("9router", "config9router.yaml"),
         "freellmapi": ("FreeLLMAPI", "configfreellmapi.yaml"),
         "freeclaudecode": ("Free Claude Code", "configfreeclaudecode.yaml"),
@@ -8577,17 +8577,34 @@ class TelegramAdapter(BasePlatformAdapter):
 
     _OMNIROUTE_PROVIDER_PAGE_SIZE = 8
 
-    def _read_omniroute_client_config(self) -> tuple[str, str]:
-        """Return local OmniRoute models URL + API key without logging secrets."""
-        base_url = "http://127.0.0.1:20129/v1"
+    _ROUTER_PROVIDER_DEFAULT_BASE_URLS = {
+        "omniroute": "http://127.0.0.1:20129/v1",
+        "9router": "http://127.0.0.1:20128/v1",
+        "freellmapi": "http://127.0.0.1:3001/v1",
+        "freeclaudecode": "https://freeclaudecode.sulashop.com/v1",
+    }
+
+    def _read_router_client_config(self, router_key: str) -> tuple[str, str]:
+        """Return the active router's models URL + API key without logging secrets.
+
+        Switch mode copies a router's config file over config.yaml, and every
+        router config carries provider entries for all routers (base_url +
+        api_key). Reading the entry that matches the active router key makes
+        the Provider picker automatically follow the last router switch.
+        """
+        base_url = self._ROUTER_PROVIDER_DEFAULT_BASE_URLS.get(
+            router_key, self._ROUTER_PROVIDER_DEFAULT_BASE_URLS["omniroute"]
+        )
         api_key = ""
         try:
             import yaml
             cfg_path = self._router_config_dir() / "config.yaml"
             cfg = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
-            provider_cfg = ((cfg.get("providers") or {}).get("omniroute") or {})
+            provider_cfg = ((cfg.get("providers") or {}).get(router_key) or {})
+            if not isinstance(provider_cfg, dict):
+                provider_cfg = {}
             configured = str(provider_cfg.get("base_url") or base_url).strip().rstrip("/")
-            if configured.startswith(("http://127.0.0.1:", "http://localhost:")):
+            if configured.startswith(("http://", "https://")):
                 base_url = configured
             raw_key = str(provider_cfg.get("api_key") or "").strip()
             if raw_key.startswith("${") and raw_key.endswith("}"):
@@ -8597,12 +8614,25 @@ class TelegramAdapter(BasePlatformAdapter):
             pass
         return f"{base_url}/models", api_key
 
-    def _fetch_omniroute_provider_catalog(self) -> list[dict]:
-        """Fetch and group the local OpenAI-compatible model catalog by upstream provider."""
+    def _read_omniroute_client_config(self) -> tuple[str, str]:
+        """Backward-compatible wrapper: OmniRoute client config."""
+        return self._read_router_client_config("omniroute")
+
+    _FLAT_PROVIDER_LABEL = "all-models"
+
+    def _fetch_omniroute_provider_catalog(self, router_key: str = "omniroute") -> list[dict]:
+        """Fetch and group the active router's model catalog by upstream provider.
+
+        Routers advertise provider identity differently: OmniRoute/9router use
+        ``prefix/model`` ids (with ``owned_by`` mirroring the provider for
+        9router nodes), while FreeLLMAPI/freeclaudecode return bare model ids
+        that have no provider prefix. Bare ids are grouped under one
+        "all-models" entry so the picker still offers them.
+        """
         import json
         import urllib.request
 
-        url, api_key = self._read_omniroute_client_config()
+        url, api_key = self._read_router_client_config(router_key)
         headers = {"Accept": "application/json"}
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
@@ -8614,9 +8644,15 @@ class TelegramAdapter(BasePlatformAdapter):
             return []
         grouped: dict[str, dict[str, str]] = {}
         safe_provider = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
+        flat_models: dict[str, str] = {}
         for row in rows:
             model_id = str(row.get("id") or "").strip() if isinstance(row, dict) else ""
-            if not model_id or len(model_id) > 256 or model_id.startswith("auto/") or "/" not in model_id:
+            if not model_id or len(model_id) > 256 or model_id.startswith("auto/"):
+                continue
+            if "/" not in model_id:
+                # Bare model id (FreeLLMAPI-style flat catalog or combo routes
+                # such as 9router's smart-route): keep them in a shared entry.
+                flat_models.setdefault(model_id, model_id)
                 continue
             raw_provider = model_id.split("/", 1)[0].lower()
             owned_by = str(row.get("owned_by") or "").strip().lower()
@@ -8633,11 +8669,17 @@ class TelegramAdapter(BasePlatformAdapter):
             existing = provider_models.get(model_suffix)
             if existing is None or raw_provider == provider:
                 provider_models[model_suffix] = model_id
-        return [
+        entries = [
             {"provider": provider, "models": list(models.values())}
             for provider, models in sorted(grouped.items())
             if models
         ]
+        if flat_models:
+            entries.insert(
+                0,
+                {"provider": self._FLAT_PROVIDER_LABEL, "models": list(flat_models.values())},
+            )
+        return entries
 
     def _build_omniroute_provider_keyboard(self, providers: list[dict]) -> InlineKeyboardMarkup:
         buttons = [
@@ -8657,7 +8699,9 @@ class TelegramAdapter(BasePlatformAdapter):
         pages = max(1, (total + page_size - 1) // page_size)
         page = max(0, min(page, pages - 1))
         start, end = page * page_size, min((page + 1) * page_size, total)
-        rows = [[InlineKeyboardButton("🔄 Auto (rotate enabled models)", callback_data="opa")]]
+        rows = []
+        if state.get("auto_supported", True):
+            rows.append([InlineKeyboardButton("🔄 Auto (rotate enabled models)", callback_data="opa")])
         buttons = []
         for index in range(start, end):
             model_id = models[index]
@@ -8682,21 +8726,46 @@ class TelegramAdapter(BasePlatformAdapter):
         return InlineKeyboardMarkup(rows), info
 
     async def _send_omniroute_provider_picker(self, msg) -> None:
+        router_key, router_label = self._read_current_router_status()[:2]
+        if router_key not in self._ROUTER_CONFIGS:
+            router_key, router_label = "omniroute", "OmniRoute"
         try:
-            providers = await asyncio.to_thread(self._fetch_omniroute_provider_catalog)
+            providers = await asyncio.to_thread(
+                self._fetch_omniroute_provider_catalog, router_key
+            )
         except Exception as exc:
-            logger.warning("OmniRoute provider catalog unavailable: %s", type(exc).__name__)
-            await msg.reply_text("❌ Không tải được danh sách provider từ OmniRoute.")
+            logger.warning("Router provider catalog unavailable (%s): %s", router_key, type(exc).__name__)
+            await msg.reply_text(f"❌ Không tải được danh sách provider từ {router_label}.")
             return
         if not providers:
-            await msg.reply_text("❌ OmniRoute chưa có provider/model khả dụng.")
+            await msg.reply_text(f"❌ {router_label} chưa có provider/model khả dụng.")
             return
         chat_id = str(msg.chat.id)
         if not hasattr(self, "_omniroute_provider_state"):
             self._omniroute_provider_state = {}
-        self._omniroute_provider_state[chat_id] = {"providers": providers}
+        self._omniroute_provider_state[chat_id] = {
+            "providers": providers,
+            "router_key": router_key,
+            "router_label": router_label,
+            "auto_supported": router_key == "omniroute",
+        }
+        title = f"🔌 {router_label} Provider\n\nChọn provider muốn sử dụng:"
+        if len(providers) == 1:
+            # Single-group catalogs (flat FreeLLMAPI/freeclaudecode listings)
+            # go straight to the model list instead of a one-button screen.
+            self._omniroute_provider_state[chat_id]["selected_provider"] = providers[0]["provider"]
+            self._omniroute_provider_state[chat_id]["models"] = providers[0]["models"]
+            keyboard, info = self._build_omniroute_model_keyboard(
+                self._omniroute_provider_state[chat_id], 0
+            )
+            hint = "Chọn Auto hoặc model cố định:" if router_key == "omniroute" else "Chọn model muốn sử dụng:"
+            await msg.reply_text(
+                f"🔌 Provider: {providers[0]['provider']}{info}\n\n{hint}",
+                reply_markup=keyboard,
+            )
+            return
         await msg.reply_text(
-            "🔌 OmniRoute Provider\n\nChọn provider muốn sử dụng:",
+            title,
             reply_markup=self._build_omniroute_provider_keyboard(providers),
         )
 
@@ -8710,13 +8779,13 @@ class TelegramAdapter(BasePlatformAdapter):
         await self._send_main_menu(update, context)
         await self._send_omniroute_provider_picker(msg)
 
-    async def _dispatch_omniroute_model_switch(self, query, model_id: str) -> None:
+    async def _dispatch_omniroute_model_switch(self, query, model_id: str, router_key: str = "omniroute") -> None:
         message = getattr(query, "message", None)
         if message is None:
             await query.answer(text="Picker expired.")
             return
         event = self._build_message_event(message, MessageType.COMMAND)
-        event.text = f"/model {model_id} --provider omniroute --session"
+        event.text = f"/model {model_id} --provider {router_key} --session"
         await query.answer(text="Applying selection...")
         try:
             await query.edit_message_text(f"✅ Đang chuyển sang `{model_id}`", parse_mode=ParseMode.MARKDOWN_V2)
@@ -8743,8 +8812,9 @@ class TelegramAdapter(BasePlatformAdapter):
         if data == "opb":
             state.pop("selected_provider", None)
             state.pop("models", None)
+            router_label = str(state.get("router_label") or "OmniRoute")
             await query.edit_message_text(
-                "🔌 OmniRoute Provider\n\nChọn provider muốn sử dụng:",
+                f"🔌 {router_label} Provider\n\nChọn provider muốn sử dụng:",
                 reply_markup=self._build_omniroute_provider_keyboard(state["providers"]),
             )
             await query.answer()
@@ -8778,12 +8848,16 @@ class TelegramAdapter(BasePlatformAdapter):
             await query.answer()
             return
         if data == "opa":
+            if not state.get("auto_supported", False):
+                await query.answer(text="Router này không hỗ trợ Auto.")
+                return
             provider = str(state.get("selected_provider") or "")
             if not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,63}", provider):
                 await query.answer(text="Provider không hợp lệ.")
                 return
+            router_key = str(state.get("router_key") or "omniroute")
             getattr(self, "_omniroute_provider_state", {}).pop(chat_id, None)
-            await self._dispatch_omniroute_model_switch(query, f"auto/provider/{provider}")
+            await self._dispatch_omniroute_model_switch(query, f"auto/provider/{provider}", router_key)
             return
         if data.startswith("opm:"):
             try:
@@ -8791,8 +8865,9 @@ class TelegramAdapter(BasePlatformAdapter):
             except (ValueError, IndexError, KeyError):
                 await query.answer(text="Model không hợp lệ.")
                 return
+            router_key = str(state.get("router_key") or "omniroute")
             getattr(self, "_omniroute_provider_state", {}).pop(chat_id, None)
-            await self._dispatch_omniroute_model_switch(query, model_id)
+            await self._dispatch_omniroute_model_switch(query, model_id, router_key)
             return
         await query.answer(text="Lựa chọn không hợp lệ.")
 

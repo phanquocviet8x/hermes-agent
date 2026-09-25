@@ -41,7 +41,7 @@ def _make_adapter(tmp_path, monkeypatch):
     adapter._bot = AsyncMock()
     adapter._app = MagicMock()
     adapter._ROUTER_CONFIGS = {
-        "omniroute": ("OmniRoute", "configomnirote.yaml"),
+        "omniroute": ("OmniRoute", "configomniroute.yaml"),
         "9router": ("9router", "config9router.yaml"),
         "freellmapi": ("FreeLLMAPI", "configfreellmapi.yaml"),
     }
@@ -269,12 +269,12 @@ async def test_router_callback_copies_source_to_config_yaml_without_deleting_sou
 
 
 @pytest.mark.asyncio
-async def test_omniroute_router_uses_configomnirote_file_name(tmp_path, monkeypatch):
-    """OmniRoute switch mode must copy configomnirote.yaml, not stale configominiroute.yaml."""
+async def test_omniroute_router_uses_configomniroute_file_name(tmp_path, monkeypatch):
+    """OmniRoute switch mode must copy configomniroute.yaml (renamed standard), not old names."""
     adapter = _make_adapter(tmp_path, monkeypatch)
     hermes_home = tmp_path / ".hermes"
-    stale = hermes_home / "configominiroute.yaml"
-    correct = hermes_home / "configomnirote.yaml"
+    stale = hermes_home / "configomnirote.yaml"
+    correct = hermes_home / "configomniroute.yaml"
     stale.write_text(
         yaml.safe_dump({"model": {"provider": "wrong-omni", "default": "wrong-model"}}),
         encoding="utf-8",
@@ -301,4 +301,92 @@ async def test_omniroute_router_uses_configomnirote_file_name(tmp_path, monkeypa
     cfg = yaml.safe_load(dest.read_text(encoding="utf-8"))
     assert cfg["model"]["provider"] == "omniroute"
     assert cfg["model"]["default"] == "right-model"
-    assert "configomnirote.yaml" in query.edit_message_text.await_args.kwargs["text"]
+    assert "configomniroute.yaml" in query.edit_message_text.await_args.kwargs["text"]
+
+
+def test_router_client_config_follows_active_router(tmp_path, monkeypatch):
+    """Provider picker reads the active router's own provider entry from config.yaml."""
+    adapter = _make_adapter(tmp_path, monkeypatch)
+    hermes_home = tmp_path / ".hermes"
+    (hermes_home / "config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "model": {"provider": "9router", "default": "smart-route"},
+                "providers": {
+                    "omniroute": {"base_url": "http://localhost:20129/v1", "api_key": "omni-key"},
+                    "9router": {"base_url": "http://localhost:20128/v1", "api_key": "nr-key"},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("NR_KEY", raising=False)
+
+    url, key = adapter._read_router_client_config("9router")
+    assert url == "http://localhost:20128/v1/models"
+    assert key == "nr-key"
+
+    url, key = adapter._read_router_client_config("omniroute")
+    assert url == "http://localhost:20129/v1/models"
+    assert key == "omni-key"
+
+
+def test_provider_catalog_groups_prefixed_and_flat_models(tmp_path, monkeypatch):
+    """Prefixed ids group by provider; bare ids land in the all-models entry."""
+    adapter = _make_adapter(tmp_path, monkeypatch)
+    payload = (
+        b'{"data":[{"id":"b.ai/glm-5.3-flash","owned_by":"b.ai"},'
+        b'{"id":"gh/gpt-4.1","owned_by":"gh"},{"id":"smart-route","owned_by":"combo"}]}'
+    )
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, _limit):
+            return payload
+
+    monkeypatch.setattr(
+        adapter,
+        "_read_router_client_config",
+        lambda router_key: ("http://127.0.0.1:20128/v1/models", "secret-not-logged"),
+    )
+    monkeypatch.setattr("urllib.request.urlopen", lambda *_args, **_kwargs: FakeResponse())
+
+    entries = adapter._fetch_omniroute_provider_catalog("9router")
+    assert entries == [
+        {"provider": "all-models", "models": ["smart-route"]},
+        {"provider": "b.ai", "models": ["b.ai/glm-5.3-flash"]},
+        {"provider": "gh", "models": ["gh/gpt-4.1"]},
+    ]
+
+
+def test_flat_catalog_groups_single_all_models_entry(tmp_path, monkeypatch):
+    """FreeLLMAPI-style flat catalogs collapse into one all-models entry."""
+    adapter = _make_adapter(tmp_path, monkeypatch)
+    payload = b'{"data":[{"id":"auto"},{"id":"fusion"},{"id":"qwen3.6-27b"}]}'
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, _limit):
+            return payload
+
+    monkeypatch.setattr(
+        adapter,
+        "_read_router_client_config",
+        lambda router_key: ("http://127.0.0.1:3001/v1/models", "secret-not-logged"),
+    )
+    monkeypatch.setattr("urllib.request.urlopen", lambda *_args, **_kwargs: FakeResponse())
+
+    entries = adapter._fetch_omniroute_provider_catalog("freellmapi")
+    assert entries == [
+        {"provider": "all-models", "models": ["auto", "fusion", "qwen3.6-27b"]},
+    ]
