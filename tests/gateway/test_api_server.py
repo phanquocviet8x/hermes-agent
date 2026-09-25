@@ -2620,9 +2620,33 @@ class TestStoredSessionModelFilter:
         adapter = _make_routing_adapter({})
         assert adapter._stored_session_model({"model": adapter._model_name}) is None
 
-    def test_real_model_passes_through(self):
+    def test_real_api_model_passes_through(self):
         adapter = _make_routing_adapter({})
-        assert adapter._stored_session_model({"model": "google/gemini-3.7-flash"}) == "google/gemini-3.7-flash"
+        assert adapter._stored_session_model({
+            "source": "api_server",
+            "model": "google/gemini-3.7-flash",
+        }) == "google/gemini-3.7-flash"
+
+    def test_messaging_session_ignores_stale_stored_model(self):
+        """Imported messaging sessions follow the admin-selected gateway model.
+
+        The session row's model is historical UI metadata. Telegram/mobile
+        bridge turns must not be pinned forever to an old DB value like
+        bai/qwen3.8-flash after the admin switches /model or returns to auto.
+        """
+        adapter = _make_routing_adapter({})
+        assert adapter._stored_session_model({
+            "source": "telegram",
+            "model": "bai/qwen3.8-flash",
+        }) is None
+
+    def test_api_session_keeps_explicit_stored_model(self):
+        """Native API sessions created with an explicit model remain pinned."""
+        adapter = _make_routing_adapter({})
+        assert adapter._stored_session_model({
+            "source": "api_server",
+            "model": "google/gemini-3.7-flash",
+        }) == "google/gemini-3.7-flash"
 
     def test_missing_or_bad_shapes(self):
         adapter = _make_routing_adapter({})

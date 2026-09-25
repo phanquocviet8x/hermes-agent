@@ -2486,16 +2486,22 @@ class APIServerAdapter(BasePlatformAdapter):
         return self._model_routes.get(model_alias)
 
     def _stored_session_model(self, session: Any) -> Optional[str]:
-        """The model persisted on a session row, minus the virtual alias.
+        """Return a pinned model only for native API-owned sessions.
 
-        The advertised virtual model (usually ``hermes-agent``) means "use
-        the gateway default". Session creation persists it when the client
-        sent no model, and replaying it upstream as a raw provider model id
-        400s ("hermes-agent is not a valid model ID") — the same filter
-        ``_request_agent_overrides`` applies to per-request bodies. One
-        resolver for both session-chat sites (sync + stream).
+        Imported messaging sessions (telegram/discord/slack/etc.) use the
+        session row's ``model`` as historical UI metadata. Bridge turns posted
+        through the API server must follow the admin-selected gateway model
+        (/model, /provider, or global auto) instead of being pinned forever to
+        whatever model happened to be active when the messaging session row was
+        created. Native API sessions still honor an explicit creation-time
+        model so the existing API contract remains intact.
         """
-        stored = session.get("model") if isinstance(session, dict) else None
+        if not isinstance(session, dict):
+            return None
+        source = str(session.get("source") or "").strip().lower()
+        if source not in {"api_server", "hermes_browser", "browser", "dashboard"}:
+            return None
+        stored = session.get("model")
         if not stored or stored == self._model_name:
             return None
         return stored
