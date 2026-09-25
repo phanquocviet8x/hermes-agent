@@ -1831,9 +1831,22 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         return self._model_routes.get(model_alias) if isinstance(model_alias, str) else None
 
     def _stored_session_model(self, session: Any) -> Optional[str]:
-        """The model persisted on a session row, minus the virtual alias (replaying
-        "hermes-agent" upstream as a provider model id 400s)."""
-        stored = session.get("model") if isinstance(session, dict) else None
+        """Return a pinned model only for native API-owned sessions.
+
+        Imported messaging sessions (telegram/discord/slack/etc.) use the
+        session row's ``model`` as historical UI metadata. Bridge turns posted
+        through the API server must follow the admin-selected gateway model
+        (/model, /provider, or global auto) instead of being pinned forever to
+        whatever model happened to be active when the messaging session row was
+        created. Native API sessions still honor an explicit creation-time
+        model so the existing API contract remains intact.
+        """
+        if not isinstance(session, dict):
+            return None
+        source = str(session.get("source") or "").strip().lower()
+        if source not in {"api_server", "hermes_browser", "browser", "dashboard"}:
+            return None
+        stored = session.get("model")
         if not stored or stored == self._model_name:
             return None
         return stored
