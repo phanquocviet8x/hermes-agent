@@ -240,7 +240,7 @@ async def test_group_live_search_query_bypasses_mention_gate_only_for_initiator(
 def test_gateway_model_picker_loads_full_catalog_for_live_search():
     """The gateway passes no initial model cap: pagination protects the UI,
     while live search needs the complete callable catalog."""
-    source = (Path(__file__).parents[2] / "gateway" / "slash_commands.py").read_text(encoding="utf-8")
+    source = (Path(__file__).parents[2] / "gateway" / "slash_commands_model.py").read_text(encoding="utf-8")
     assert "max_models=None" in source
 
 
