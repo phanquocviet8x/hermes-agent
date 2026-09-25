@@ -610,6 +610,15 @@ class _PollingLifecycleAbort(RuntimeError):
 
 
 class TelegramAdapter(BasePlatformAdapter):
+    # 0.21.5 upstream detects button approvals via ``supports_exec_approval_buttons``
+    # (it checks the ``_send_exec_approval_prompt`` hook, which our custom
+    # ``send_exec_approval`` override does not go through). Declare it explicitly so
+    # the runner sends the interactive card (Allow Once/Session/Always/Deny) instead
+    # of the plain-text ``/approve`` fallback.
+    @classmethod
+    def supports_exec_approval_buttons(cls) -> bool:
+        return True
+
     """
     Telegram bot adapter.
 
