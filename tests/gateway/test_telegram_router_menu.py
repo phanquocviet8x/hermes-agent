@@ -84,7 +84,7 @@ async def test_main_menu_uses_switch_mode_and_model_buttons(tmp_path, monkeypatc
 
     args = msg.reply_text.await_args.args
     assert "Router hiện tại" in args[0]
-    assert captured_keyboard["args"][0] == [["Switch mode", "Provider", "Model"], ["Free Claude Code"]]
+    assert captured_keyboard["args"][0] == [["Switch mode", "Provider", "Model"]]
 
 
 @pytest.mark.asyncio

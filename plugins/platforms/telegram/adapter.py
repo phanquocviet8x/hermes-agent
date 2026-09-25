@@ -8950,7 +8950,7 @@ class TelegramAdapter(BasePlatformAdapter):
         await msg.reply_text(
             f"Chọn từ menu dưới đây hoặc gõ lệnh:\nRouter hiện tại: {current_label}\nModel hiện tại: {current_model}",
             reply_markup=ReplyKeyboardMarkup(
-                [["Switch mode", "Provider", "Model"], ["Free Claude Code"]],
+                [["Switch mode", "Provider", "Model"]],
                 resize_keyboard=True,
                 one_time_keyboard=False,
                 input_field_placeholder="Chọn một tùy chọn:",
